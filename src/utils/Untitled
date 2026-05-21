@@ -1,0 +1,63 @@
+# How geoFixer works
+
+On each new GPS fix, `RouteRecorder` calls `fixPoints` to smooth the trail and snap it to roads via OSRM — all while recording, not after the drive.
+
+## The overall flow
+
+When a new point comes in, it goes through a few stages in order.
+
+First, the new fix gets nudged based on where you were already heading (`getNewPointWithBias`). Then the last bit of the trail gets looked at again — some points get averaged, and a small window near the end gets sent to OSRM (`fixPastPoints`). After that, points that are basically sitting on top of older ones get removed (`removePointsTouchingManyPast`). Finally, if the route is still very short (five points or fewer), the whole thing gets map-matched to the road network in one go (`snapIfFew`).
+
+The recorder also ignores fixes where accuracy is worse than 9 meters, so really bad samples never enter the pipeline.
+
+## Smoothing the incoming point
+
+`getNewPointWithBias` runs before the new point is added to the list. It looks at the last two points already on the trail and the fresh GPS reading.
+
+From those three positions it figures out the angle of the last leg you drove and the angle of the new leg the GPS is suggesting. It keeps the step length from the GPS (how far this fix is from the previous one) but adjusts the direction: instead of trusting the noisy new angle completely, it blends it toward the previous heading. The default blend is 0.4 — so the new point still moves forward, but not as wildly as the raw fix might say.
+
+If the turn is sharp (more than about 30 degrees between the two segments), the blend gets weaker so you do not over-smooth corners. The adjusted position is placed one step along that blended angle from the last recorded point.
+
+On straight sections this calms jitter. On turns it tries to back off so the corner does not get rounded away entirely.
+
+## Fixing points already recorded
+
+`fixPastPoints` only kicks in once there are at least seven points. Before that there is not enough trail to do anything useful.
+
+When it does run, it walks over the last few indices near the end of the array. For the point that is fourth from the end, it takes a window of the last six points, sends them to OSRM map matching, and writes the snapped coordinates back. For the other slot in that small loop (fifth from last), it runs `averageOutPoints` instead: if the turn at that point is gentle, its lat/lng becomes the average of its neighbors; if the turn is sharp (again over ~30°), it is left alone so corners are not flattened.
+
+So the very tip of the route gets OSRM treatment on a chunk of recent history, and one point just behind that gets a simple three-point average when the path is not turning hard.
+
+## Removing clutter when you are not really moving
+
+GPS keeps firing even when the car is slow or stopped. You end up with a pile of points in roughly the same place.
+
+`removePointsTouchingManyPast` goes through the list from the end backward. For each point it counts how many earlier points are within touching distance — roughly up to 25 meters, scaled down if the reported accuracy is better. If more than five older points are that close, the current one is dropped.
+
+That trims the blob of fixes you get when stationary without trying to delete points that are legitimately far apart along the road.
+
+## Snapping to roads with OSRM
+
+Most of the road alignment uses OSRM's public match API. Points are sent as `lng,lat` with timestamps and a search radius per point derived from GPS accuracy (clamped between 10 and 50 meters). Gaps in the trace are ignored so a missed fix does not break the match.
+
+If there are only one or two points, nearest-on-road is used instead. When the whole route is still short (five points or fewer), every update re-matches the full list so the early part of the line does not look random before you have much history.
+
+If OSRM fails or rate-limits, the code just keeps the coordinates it already had — nothing crashes, you just do not get snapping that frame.
+
+## A few numbers worth knowing
+
+The bias (default 0.4) controls how much each new point follows the direction you were already going versus the direction the raw GPS suggests. At 0.4, roughly 40% of the heading correction pulls toward the previous segment and 60% stays with the new fix — enough to dampen jitter without ignoring real turns. On sharp corners the code lowers that blend so it does not drag the line through the bend.
+
+Early full-route snapping stops once you have more than five points (the tail window in `fixPastPoints` still gets matched). Stationary cleanup drops a point if more than five older ones sit within touching distance. The 30-degree turn threshold is used in both the bias step and the averaging step.
+
+The approach works best when fixes arrive at fairly steady intervals. OSRM map matching uses timestamps to line points up with the road graph; big gaps or bursts of points make matching and the heading blend less reliable.
+
+`lerpAngle` handles angle wrap-around so blending headings does not jump the wrong way across ±180°. Distances for the touch check use haversine; the step length in the bias function uses a simple lat/lng distance which is good enough at this scale.
+
+## What does not work perfectly yet
+
+Everything depends on the demo OSRM server being up and not throttling you. Only the recent tail of the route gets re-snapped as you drive — older points stay wherever they landed. Deletion can be a bit aggressive if GPS wanders in a tight area while you are moving slowly. And corners are the weak spot: the code avoids over-smoothing sharp turns, but it does not add extra vertices along a corner, so the line can still cut the bend instead of following it.
+
+## What would I do if I had more time
+
+I would try to detect corners based on the previous nodes' angles and create extra points between them then snap them to the nearest node in order to fix the issue with the corners.
